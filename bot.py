@@ -9,6 +9,7 @@ import threading
 import schedule
 import os
 from flask import Flask
+import hashlib
 
 # ========== НАСТРОЙКИ ==========
 TOKEN = os.environ.get("TOKEN")
@@ -21,10 +22,10 @@ if not TOKEN:
 bot = telebot.TeleBot(TOKEN)
 app = Flask(__name__)
 
-# Хранилище выбранных групп (chat_id -> название группы)
-user_groups = {}
-# Для пагинации
+user_groups = {}          # chat_id -> группа
 user_pages = {}
+all_users = set()         # все, кто когда-либо писал боту
+last_changes_hash = None  # хеш последних изменений
 
 @app.route('/')
 def home():
@@ -33,13 +34,12 @@ def home():
 # ==================== ПАРСИНГ ====================
 
 def get_all_groups():
-    """Получает список всех групп с сайта"""
     url = "https://college-edu.ru/stud/raspisanie/"
     try:
         r = requests.get(url, timeout=15)
         r.encoding = "utf-8"
         soup = BeautifulSoup(r.text, "html.parser")
-    except Exception as e:
+    except:
         return []
 
     groups = []
@@ -49,8 +49,51 @@ def get_all_groups():
             groups.append(text.replace("Группа ", "").strip())
     return groups
 
+def get_changes():
+    """Возвращает текст изменений или None, если их нет"""
+    url = "https://college-edu.ru/stud/raspisanie/"
+    try:
+        r = requests.get(url, timeout=15)
+        r.encoding = "utf-8"
+        soup = BeautifulSoup(r.text, "html.parser")
+    except:
+        return None
+
+    # Ищем блок изменений
+    text = soup.get_text("\n", strip=True)
+    
+    # Ищем начало и конец блока изменений
+    start_markers = ["Изменения в расписании", "ИЗМЕНЕНИЯ В РАСПИСАНИИ"]
+    end_markers = ["ДГД 302", "Группа ДГД", "Расписание занятий ·"]
+
+    start_idx = -1
+    for marker in start_markers:
+        start_idx = text.find(marker)
+        if start_idx != -1:
+            break
+
+    if start_idx == -1:
+        return None
+
+    # Обрезаем от начала изменений
+    changes_text = text[start_idx:]
+
+    # Ищем конец блока (начало списка групп)
+    for marker in end_markers:
+        end_idx = changes_text.find(marker)
+        if end_idx != -1 and end_idx > 50:
+            changes_text = changes_text[:end_idx]
+            break
+
+    changes_text = changes_text.strip()
+
+    # Если слишком коротко — считаем, что изменений нет
+    if len(changes_text) < 40:
+        return None
+
+    return changes_text
+
 def get_schedule(group_name):
-    """Получает расписание конкретной группы"""
     url = "https://college-edu.ru/stud/raspisanie/"
     try:
         r = requests.get(url, timeout=15)
@@ -163,11 +206,9 @@ def make_groups_keyboard(page=0, per_page=8):
     page_groups = groups[start:end]
 
     for g in page_groups:
-        # Обрезаем длинные названия для кнопок
         btn_text = g if len(g) < 40 else g[:37] + "..."
         markup.add(types.InlineKeyboardButton(btn_text, callback_data=f"grp:{g}"))
 
-    # Кнопки навигации
     nav = []
     if page > 0:
         nav.append(types.InlineKeyboardButton("⬅️ Назад", callback_data=f"page:{page-1}"))
@@ -181,7 +222,7 @@ def make_groups_keyboard(page=0, per_page=8):
 def main_menu_keyboard(has_group=False):
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
     markup.add("📅 Сегодня", "📅 Завтра")
-    markup.add("📆 Неделя")
+    markup.add("📆 Неделя", "⚠️ Изменения")
     if has_group:
         markup.add("🔄 Сменить группу")
     else:
@@ -193,11 +234,12 @@ def main_menu_keyboard(has_group=False):
 @bot.message_handler(commands=['start', 'help'])
 def start(message):
     chat_id = message.chat.id
+    all_users.add(chat_id)
     has_group = chat_id in user_groups
 
     text = (
         "Привет! Я бот с расписанием <b>всех групп</b> колледжа КЭСИ 📚\n\n"
-        "Сначала выбери свою группу, потом сможешь смотреть расписание."
+        "Сначала выбери свою группу."
     )
     if has_group:
         text += f"\n\nТекущая группа: <b>{user_groups[chat_id]}</b>"
@@ -211,6 +253,7 @@ def start(message):
 @bot.message_handler(func=lambda m: m.text in ["📋 Выбрать группу", "🔄 Сменить группу"])
 def choose_group(message):
     chat_id = message.chat.id
+    all_users.add(chat_id)
     user_pages[chat_id] = 0
     bot.send_message(chat_id, "Выбери свою группу:", reply_markup=make_groups_keyboard(0))
 
@@ -227,9 +270,10 @@ def page_callback(call):
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("grp:"))
 def group_selected(call):
-    group = call.data[4:]  # убираем "grp:"
+    group = call.data[4:]
     chat_id = call.message.chat.id
     user_groups[chat_id] = group
+    all_users.add(chat_id)
 
     bot.answer_callback_query(call.id, f"Выбрана группа: {group}")
     bot.edit_message_text(
@@ -244,6 +288,7 @@ def group_selected(call):
 @bot.message_handler(func=lambda m: m.text == "📅 Сегодня")
 def today_cmd(message):
     chat_id = message.chat.id
+    all_users.add(chat_id)
     if chat_id not in user_groups:
         bot.send_message(chat_id, "Сначала выбери группу!", reply_markup=make_groups_keyboard(0))
         return
@@ -255,6 +300,7 @@ def today_cmd(message):
 @bot.message_handler(func=lambda m: m.text == "📅 Завтра")
 def tomorrow_cmd(message):
     chat_id = message.chat.id
+    all_users.add(chat_id)
     if chat_id not in user_groups:
         bot.send_message(chat_id, "Сначала выбери группу!", reply_markup=make_groups_keyboard(0))
         return
@@ -266,6 +312,7 @@ def tomorrow_cmd(message):
 @bot.message_handler(func=lambda m: m.text == "📆 Неделя")
 def week_cmd(message):
     chat_id = message.chat.id
+    all_users.add(chat_id)
     if chat_id not in user_groups:
         bot.send_message(chat_id, "Сначала выбери группу!", reply_markup=make_groups_keyboard(0))
         return
@@ -273,7 +320,38 @@ def week_cmd(message):
     result = get_week_schedule(user_groups[chat_id])
     bot.send_message(chat_id, result, parse_mode="HTML")
 
-# ==================== АВТОРАССЫЛКА ====================
+@bot.message_handler(commands=['изменения', 'changes'])
+@bot.message_handler(func=lambda m: m.text == "⚠️ Изменения")
+def changes_cmd(message):
+    chat_id = message.chat.id
+    all_users.add(chat_id)
+    bot.send_chat_action(chat_id, 'typing')
+    changes = get_changes()
+    if changes:
+        bot.send_message(chat_id, f"⚠️ <b>Изменения в расписании</b>\n\n{changes}", parse_mode="HTML")
+    else:
+        bot.send_message(chat_id, "Сейчас изменений в расписании нет.")
+
+# ==================== АВТОМАТИКА ====================
+
+def check_and_send_changes():
+    global last_changes_hash
+
+    changes = get_changes()
+    if not changes:
+        return
+
+    current_hash = hashlib.md5(changes.encode()).hexdigest()
+
+    if current_hash != last_changes_hash:
+        last_changes_hash = current_hash
+        text = f"⚠️ <b>Появились изменения в расписании!</b>\n\n{changes}"
+
+        for chat_id in list(all_users):
+            try:
+                bot.send_message(chat_id, text, parse_mode="HTML")
+            except Exception:
+                all_users.discard(chat_id)
 
 def send_daily():
     if not user_groups:
@@ -286,7 +364,14 @@ def send_daily():
             pass
 
 def run_scheduler():
+    # Проверка изменений каждые 20 минут
+    schedule.every(20).minutes.do(check_and_send_changes)
+    # Расписание на завтра в 20:00
     schedule.every().day.at("20:00").do(send_daily)
+
+    # Первая проверка сразу при запуске
+    check_and_send_changes()
+
     while True:
         schedule.run_pending()
         time.sleep(30)
