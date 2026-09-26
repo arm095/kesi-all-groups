@@ -367,7 +367,7 @@ def run_scheduler():
     # Проверка изменений каждые 20 минут
     schedule.every(20).minutes.do(check_and_send_changes)
     # Расписание на завтра в 20:00
-    schedule.every().day.at("20:00").do(send_daily)
+    schedule.every().day.at("17:00").do(send_daily)
 
     # Первая проверка сразу при запуске
     check_and_send_changes()
