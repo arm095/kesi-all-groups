@@ -387,7 +387,7 @@ def send_daily():
 
 def run_scheduler():
     schedule.every(20).minutes.do(check_and_send_changes)
-    schedule.every().day.at("20:00").do(send_daily)
+    schedule.every().day.at("17:00").do(send_daily)
     check_and_send_changes()
 
     while True:
