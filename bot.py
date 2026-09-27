@@ -13,6 +13,7 @@ import hashlib
 
 # ========== НАСТРОЙКИ ==========
 TOKEN = os.environ.get("TOKEN")
+CACHE_TIME = 7 * 60   # 7 минут
 # ==============================
 
 if not TOKEN:
@@ -22,47 +23,61 @@ if not TOKEN:
 bot = telebot.TeleBot(TOKEN)
 app = Flask(__name__)
 
-user_groups = {}          # chat_id -> группа
+user_groups = {}
 user_pages = {}
-all_users = set()         # все, кто когда-либо писал боту
-last_changes_hash = None  # хеш последних изменений
+all_users = set()
+last_changes_hash = None
+
+# ========== КЭШ ==========
+cache = {
+    "groups": {"data": None, "time": 0},
+    "changes": {"data": None, "time": 0},
+    "schedules": {}   # group_name -> {"data": ..., "time": ...}
+}
 
 @app.route('/')
 def home():
     return "Bot is alive!"
 
+def is_cache_valid(cache_entry):
+    return cache_entry["data"] is not None and (time.time() - cache_entry["time"]) < CACHE_TIME
+
 # ==================== ПАРСИНГ ====================
 
 def get_all_groups():
+    if is_cache_valid(cache["groups"]):
+        return cache["groups"]["data"]
+
     url = "https://college-edu.ru/stud/raspisanie/"
     try:
         r = requests.get(url, timeout=15)
         r.encoding = "utf-8"
         soup = BeautifulSoup(r.text, "html.parser")
     except:
-        return []
+        return cache["groups"]["data"] or []
 
     groups = []
     for h2 in soup.find_all("h2"):
         text = h2.get_text(strip=True)
         if text.startswith("Группа "):
             groups.append(text.replace("Группа ", "").strip())
+
+    cache["groups"] = {"data": groups, "time": time.time()}
     return groups
 
 def get_changes():
-    """Возвращает текст изменений или None, если их нет"""
+    if is_cache_valid(cache["changes"]):
+        return cache["changes"]["data"]
+
     url = "https://college-edu.ru/stud/raspisanie/"
     try:
         r = requests.get(url, timeout=15)
         r.encoding = "utf-8"
         soup = BeautifulSoup(r.text, "html.parser")
     except:
-        return None
+        return cache["changes"]["data"]
 
-    # Ищем блок изменений
     text = soup.get_text("\n", strip=True)
-    
-    # Ищем начало и конец блока изменений
     start_markers = ["Изменения в расписании", "ИЗМЕНЕНИЯ В РАСПИСАНИИ"]
     end_markers = ["ДГД 302", "Группа ДГД", "Расписание занятий ·"]
 
@@ -73,12 +88,10 @@ def get_changes():
             break
 
     if start_idx == -1:
+        cache["changes"] = {"data": None, "time": time.time()}
         return None
 
-    # Обрезаем от начала изменений
     changes_text = text[start_idx:]
-
-    # Ищем конец блока (начало списка групп)
     for marker in end_markers:
         end_idx = changes_text.find(marker)
         if end_idx != -1 and end_idx > 50:
@@ -86,20 +99,26 @@ def get_changes():
             break
 
     changes_text = changes_text.strip()
-
-    # Если слишком коротко — считаем, что изменений нет
     if len(changes_text) < 40:
-        return None
+        changes_text = None
 
+    cache["changes"] = {"data": changes_text, "time": time.time()}
     return changes_text
 
 def get_schedule(group_name):
+    # Проверяем кэш для конкретной группы
+    if group_name in cache["schedules"] and is_cache_valid(cache["schedules"][group_name]):
+        return cache["schedules"][group_name]["data"], group_name
+
     url = "https://college-edu.ru/stud/raspisanie/"
     try:
         r = requests.get(url, timeout=15)
         r.encoding = "utf-8"
         soup = BeautifulSoup(r.text, "html.parser")
     except Exception as e:
+        # Если ошибка — пробуем отдать старый кэш
+        if group_name in cache["schedules"]:
+            return cache["schedules"][group_name]["data"], group_name
         return None, f"Ошибка загрузки сайта: {e}"
 
     group_h2 = None
@@ -141,6 +160,9 @@ def get_schedule(group_name):
             else:
                 i += 1
         schedule_dict[day] = pairs
+
+    # Сохраняем в кэш
+    cache["schedules"][group_name] = {"data": schedule_dict, "time": time.time()}
     return schedule_dict, group_name
 
 def format_day(day_name, pairs):
@@ -364,12 +386,8 @@ def send_daily():
             pass
 
 def run_scheduler():
-    # Проверка изменений каждые 20 минут
     schedule.every(20).minutes.do(check_and_send_changes)
-    # Расписание на завтра в 20:00
-    schedule.every().day.at("17:00").do(send_daily)
-
-    # Первая проверка сразу при запуске
+    schedule.every().day.at("20:00").do(send_daily)
     check_and_send_changes()
 
     while True:
